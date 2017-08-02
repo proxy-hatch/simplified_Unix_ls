@@ -7,4 +7,9 @@ Virtual_Memory&UNIX_ls_cmd
 //// Last Modified: Jul , 2017
 //// Email: yxwang@sfu.ca
 
-1.
+This directory was built to test the ls cmd.
+
+It is designed to contain files of differentL: 
+1. priviledges
+2. groups
+3. owners
