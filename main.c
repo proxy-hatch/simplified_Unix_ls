@@ -38,12 +38,12 @@
 #include <stdlib.h>     // malloc() free()
 #include <pwd.h>        // getpwuid()
 #include <grp.h>        // getgrgid()
+#include <libgen.h>     // basename()
 
 // DEBUG macro is used to turn on various debugging features
 // Disable at the release version
 #define DEBUG
 
-#define MAXDIRCOUNT 256
 /* POSIX.1 says each process has at least 20 file descriptors.
  * Three of those belong to the standard streams.
  * Here, we use a conservative estimate of 15 available;
@@ -60,18 +60,17 @@
 #define USE_FDS 15  // the maximum number of directories that ftw() will hold open simultaneously
 #endif
 
-// for use to indicate which flag was used
-static int iFlag;
-static int RFlag;
-static int lFlag;
-
 #ifndef BUFFSIZE
 #define BUFFSIZE 1024
 #endif
 
-// for printSubDir() [fn() in nftw()]
-static char currSubDir[BUFFSIZE];
+// to keep track of where we are processing
+static char currDir[BUFFSIZE];
 
+// for use to indicate which flag was used
+static int iFlag;
+static int RFlag;
+static int lFlag;
 
 // Finds a specific string in a (portion of) str array
 // used for finding special patterns '..', '.', '~' in argv[]
@@ -91,37 +90,33 @@ int print_directory_tree(const char *const dirpath);
 static int printFile(const char *filepath, const struct stat *info,
                      const int typeflag, struct FTW *pathinfo);
 
-// prints the all the file/dir info in a dir given
-// recursive call to itself to handle the '-R' flag
-// modified based on: https://stackoverflow.com/a/8438663
-static int printSubDir(const char *filepath, const struct stat *info,
-                       const int typeflag, struct FTW *pathinfo);
-
 // This is a non-standard system function on Solaris only
 // Hence must be defined in UNIX (despite having to type out its name..)
 // https://stackoverflow.com/a/9639381/5340330
 char const *sperm(__mode_t mode);
 
 // Boolean func to determine whether the filepath is a special directory
-// special directory is defined as one of the three: '.', '..', or a hidden file (name beginning with ./.xx)
-// assumes the filepath always starts with './xxx'
+// special directory is defined as one of the three: '.', '..', or a hidden file (name beginning with .xx)
+// filename must not contain path (including ./xxx)
 // return 1 for true; 0 for false
-int isSpecialDir(const char *filePath);
+int isSpecialDir(const char *filename);
 
-// determine the current subdirectory that filepath is pointing to by counting the number of '/'s
-// return the pos of the last '/'
-// return 0 if last '/' is at 1, as filepath always begins with './'
-size_t findCurrSubDirIdx(const char *filepath, size_t filepathLength);
+// determines if the first x chars matches currDir, if it does, we can assume that its a subdirectory
+// handles filepaths in the format of both './xxx' and plain 'xxx'
+// returns non-zero for true, 0 for false
+int isSubDir(const char *filePath);
+
+// this function trims the filepath
+// similar to basename(), but substitutes the filename to '.' if it matches currDir[]
+void getFilename(char *filename, const char *filepath);
 
 int main(int argc, char *argv[]) {
     iFlag = 0;
     RFlag = 0;
     lFlag = 0;
-    // dynamic str arr to store all the directory names
-    char *dirsBuff[MAXDIRCOUNT];
+
     int index;
     int flagChar;
-    int dirCount = 0;
     int ret;
     opterr = 0;
 
@@ -188,66 +183,6 @@ static int findArgument(char *pattern, char **strArr, int beginArrPos, int endAr
     return -1;
 }
 
-// recursively print_dir_tree
-// modified based on: https://stackoverflow.com/a/8438663
-static int printSubDir(const char *filepath, const struct stat *info,
-                       const int typeflag, struct FTW *pathinfo) {
-    // ignore . and .. and hidden files
-    if (isSpecialDir(filepath))
-        return 0;
-
-    /*
-     * else if (typeflag == FTW_D || typeflag == FTW_DP)
-     * print_directory_tree(filepath);
-     * recursively calling this would obviously be the most elegant solution, however due to the fact that nftw() does
-     * not support recursive call that modifies . and .. (even with FTW_CHDIR flag enabled), unfortunately we must
-     * create another logic to handle this.
-     */
-    size_t subDirIdx;      // the index of the last char of the dir within filepath
-    char newSubDir[BUFFSIZE];
-    int errcode=0;
-
-    subDirIdx = findCurrSubDirIdx(filepath, strlen(filepath));
-
-    if(typeflag != FTW_D && typeflag != FTW_DP && !subDirIdx)     // not a dir nor not a file in subdir
-        return 0;
-
-    // modify newSubStr if its a (file in) subdir
-    if(subDirIdx){
-        // be aware of buffer overflow
-        if(subDirIdx<BUFFSIZE){
-            strncpy(newSubDir, filepath, subDirIdx);
-            /*Warning: If there is no null byte among the first n
-             * bytes of src, the string placed in dest will not be null-terminated.
-             * http://man7.org/linux/man-pages/man3/strcpy.3.html
-             * */
-            if(subDirIdx<sizeof(newSubDir)-1)
-                newSubDir[subDirIdx]='\0';
-        }else{
-#ifdef DEBUG
-            fprintf(stderr, "printSubDir: subDirIdx=%lu overflow currSubDir[%d] for '%s'\n", (unsigned long)subDirIdx,BUFFSIZE,filepath);
-#endif
-            return 0;       // the show must go on!
-        }
-    }
-
-    // new subdir
-    if ((typeflag == FTW_D || typeflag == FTW_DP) && strcmp(filepath, currSubDir)) {
-        // update global variable
-        strcpy(currSubDir,filepath);
-        printf("\n%s:\n",currSubDir);
-    }
-
-    errcode=printFile(filepath, info, typeflag, pathinfo);
-#ifdef DEBUG
-    if(errcode)
-        fprintf(stderr,"printFile error in printSubDir '%s': %s\n",filepath,strerror(errcode));
-#endif
-
-    return 0;
-}
-
-
 // core function that prints the  info in a file/directory given
 // parameters specified by nftw()
 // https://linux.die.net/man/3/nftw
@@ -258,9 +193,13 @@ static int printFile(const char *filepath, const struct stat *info,
     struct tm mtime;
     struct passwd *pwd;
     struct group *grp;
+    char filename[BUFFSIZE];
+
+    // trim filepath
+    getFilename(filename, filepath);
 
     // ignore . and .. and hidden files
-    if (isSpecialDir(filepath))
+    if (isSpecialDir(filename) || isSubDir(filepath))
         return 0;
 
     // -i: begin the line with printing the inode #
@@ -313,8 +252,6 @@ static int printFile(const char *filepath, const struct stat *info,
     }
 
     // name printing
-    // note the filepath+2 is to neglect the first two char, which are './'
-
     // handle symbolic link
     if (typeflag == FTW_SL) {
         if (lFlag) {
@@ -352,24 +289,24 @@ static int printFile(const char *filepath, const struct stat *info,
                 break;
             }
 
-            printf(" %s -> %s\n", filepath + 2, target);
+            printf("%s -> %s\n", filename, target);
             free(target);
         } else
-            printf(" %s\n", filepath + 2);
+            printf("%s\n", filename);
     }
         // filepath is a symbolic link pointing to a nonexistent file.
     else if (typeflag == FTW_SLN)
-        printf(" %s (dangling symlink)\n", filepath + 2);
+        printf("%s (dangling symlink)\n", filename);
     else if (typeflag == FTW_F)     // regular file
-        printf(" %s\n", filepath + 2);
+        printf("%s\n", filename);
     else if (typeflag == FTW_D || typeflag == FTW_DP) {      // valid dir (FTW_DP = FTW_DEPTH was specified in flags)
-        printf(" %s\n", filepath + 2);
-        if(currSubDir[0]=='\0')     // global var will be blank when not in printSubDir()
-            return FTW_SKIP_SUBTREE;
+        printf("%s\n", filename);
+        // unreliable, handle this manually
+//        return FTW_SKIP_SUBTREE;
     } else if (typeflag == FTW_DNR)       // unreadable dir
-        printf(" %s/ (unreadable)\n", filepath + 2);
+        printf("%s/ (unreadable)\n", filename);
     else
-        printf(" %s (unknown)\n", filepath + 2);
+        printf("%s (unknown)\n", filename);
 
     return 0;
 }
@@ -433,33 +370,54 @@ static int printFile(const char *filepath, const struct stat *info,
 
 // prints the directory passed in
 int print_directory_tree(const char *const dirpath) {
-    int result;
+    int ret;
 
     // handle invalid directory path
     if (dirpath == NULL || *dirpath == '\0')
         return errno = EINVAL;
 
-    // clear currSubDir
-    memset(&currSubDir, 0, sizeof currSubDir);
-
     printf("%s:\n", dirpath);
-    result = nftw(dirpath, printFile, USE_FDS, FTW_PHYS | FTW_ACTIONRETVAL | FTW_CHDIR);     /* set FTW_PHYS: Do not follow sym links
+    strcpy(currDir, dirpath);
+    ret = nftw(dirpath, printFile, USE_FDS, FTW_PHYS);     /* set FTW_PHYS: Do not follow sym links
 *                                                                since we are doing it manually*/
     puts("");
+    if (ret)
+        return ret;
 
-    if (result > 0) {       // handle error
-        errno = result;
-    }
     // additionally, handle -R flag
-    else if (RFlag) {
-        result = nftw(dirpath, printSubDir, USE_FDS,
-                      FTW_PHYS | FTW_CHDIR);      /* printSubDir will recursively call print_directory_tree() for each dir
- * set FTW_PHYS: Do not follow sym links since we are doing it manually
- * set FTW_CHDIR: do a chdir(2) to each directory before handling its contents */
-        errno = result;     // errno=0 if no error
-    }
+    if (RFlag) {
+        DIR *dir;
+        DIR *subDir;
+        struct dirent *direntPtr;
+        char filepathBuff[BUFFSIZE];
 
-    return errno;
+        if ((dir = opendir(dirpath)) == NULL) {
+            ret = errno;
+            fprintf(stderr, "Cannot open '%s': %s\n", dirpath, strerror(ret));
+            return ret;
+        }
+        while ((direntPtr = readdir(dir)) != NULL) {
+            if (direntPtr->d_type == DT_DIR && !isSpecialDir(direntPtr->d_name)) {
+                strcpy(filepathBuff, dirpath);
+                strcat(filepathBuff, "/");
+                strcat(filepathBuff, direntPtr->d_name);
+                if ((subDir = opendir(filepathBuff)) == NULL) {
+                    ret = errno;
+                    fprintf(stderr, "Cannot open '%s': %s\n", direntPtr->d_name, strerror(ret));
+                    return ret;
+                }
+                // print entries in subdir
+                if ((ret = print_directory_tree(filepathBuff)) != 0) {
+#ifdef DEBUG
+                    fprintf(stderr, "Error in print_directory_tree(\"%s\"): %d\n", direntPtr->d_name, ret);
+#endif
+                }
+                closedir(subDir);
+            }
+        }
+        closedir(dir);
+    }
+    return 0;
 }
 
 /*
@@ -545,27 +503,43 @@ char const *sperm(__mode_t mode) {
 }
 
 // Boolean func to determine whether the filepath is a special directory
-// special directory is defined as one of the three: '.', '..', or a hidden file (name beginning with ./.xx)
-// assumes the filepath always starts with './xxx'
+// special directory is defined as one of the three: '.', '..', or a hidden file (name beginning with .xx)
+// filename must not contain path (including ./xxx)
 // return 1 for true; 0 for false
-int isSpecialDir(const char *filePath) {
-    if (strlen(filePath) <= 2 || filePath[2] == '.')        // either . or ..
+int isSpecialDir(const char *filename) {
+    if (strlen(filename) < 1 || filename[0] == '.')        // either . or ..
         return 1;
     else return 0;
 }
 
-// determine the current subdirectory that filepath is pointing to by counting the number of '/'s
-// return the pos of the last '/'
-// return 0 if last '/' is at 1, as filepath always begins with './'
-size_t findCurrSubDirIdx(const char *filepath, size_t filepathLength) {
-    size_t lastSlashIdx = 0;
-    int i;
-    for (i = 0; i < filepathLength && filepath[i] != '\0'; i++) {
-        if (filepath[i] == '/')
-            lastSlashIdx = i;
+// determines if the first x chars matches currDir, if it does, we can assume that its a subdirectory
+// handles filepaths in the format of both './xxx' and plain 'xxx'
+// returns non-zero for true, 0 for false
+int isSubDir(const char *filePath) {
+    char *ptr = (char *) filePath;
+    int len = strlen(currDir);
+    // if filepath has the format of 'currDir/xxx', we trim currDir/ from filePath
+    if (strlen(filePath) > len) {
+        char strBuff[BUFFSIZE];
+        strncpy(strBuff, filePath, (size_t) len);      // strncpy does not NULL TERMINATE!
+        strBuff[len] = '\0';
+        if (!strcmp(strBuff, currDir)) {
+            ptr = (char *) filePath + len;
+            if (filePath[len] == '/')
+                ptr++;
+        }
     }
-    if (lastSlashIdx == 1)
-        lastSlashIdx = 0;
-    return lastSlashIdx;
+    return (int) strchr(ptr, '/');
 }
 
+// this function trims the filepath
+// similar to basename(), but substitutes the filename to '.' if it matches currDir[]
+void getFilename(char *filename, const char *filePath) {
+    if (!strcmp(filePath, currDir)) {
+        filename[0] = '.';
+    } else {
+        char *namePtr = basename(filePath);
+        strcpy(filename, namePtr);
+    }
+
+}
